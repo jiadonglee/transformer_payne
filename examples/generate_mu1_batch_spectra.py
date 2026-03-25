@@ -12,6 +12,7 @@ batched inference with mu fixed to 1.0, and saves the result to .npz.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -160,6 +161,100 @@ def generate_dataset(
     return full_params, spectra, stats
 
 
+def write_dataset_npz(
+    output_path: Path,
+    wavelengths: np.ndarray,
+    compact_params: np.ndarray,
+    full_params: np.ndarray,
+    spectra: np.ndarray,
+) -> None:
+    """Write one dataset shard to a compressed npz file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        wavelengths_angstrom=wavelengths,
+        compact_params=compact_params,
+        model_params=full_params,
+        spectra=spectra,
+        mu=np.array([1.0], dtype=np.float32),
+    )
+
+
+def generate_sharded_dataset(
+    emulator: TransformerPayne,
+    compact_params: np.ndarray,
+    wavelengths: np.ndarray,
+    batch_size: int,
+    samples_per_shard: int,
+    output_path: Path,
+    vmic: float = 1.0,
+) -> tuple[list[dict[str, object]], dict[str, float]]:
+    """Generate a large dataset and write it shard-by-shard to disk."""
+    batch_fn = make_batch_infer_fn(emulator, np.log10(wavelengths))
+    shard_records: list[dict[str, object]] = []
+    compile_seconds = 0.0
+    steady_seconds = 0.0
+    n_batches = 0
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    n_samples = len(compact_params)
+    shard_index = 0
+    for shard_start in range(0, n_samples, samples_per_shard):
+        shard_stop = min(shard_start + samples_per_shard, n_samples)
+        shard_compact = compact_params[shard_start:shard_stop]
+        shard_full = expand_parameter_batch(emulator, shard_compact, vmic=vmic)
+
+        spectra_batches = []
+        for batch_start in range(0, len(shard_full), batch_size):
+            batch_stop = min(batch_start + batch_size, len(shard_full))
+            batch = jnp.asarray(shard_full[batch_start:batch_stop], dtype=jnp.float32)
+
+            t0 = time.perf_counter()
+            out = batch_fn(batch)
+            jax.block_until_ready(out)
+            elapsed = time.perf_counter() - t0
+
+            if n_batches == 0:
+                compile_seconds = elapsed
+            else:
+                steady_seconds += elapsed
+
+            spectra_batches.append(np.asarray(out, dtype=np.float32))
+            n_batches += 1
+
+        shard_spectra = np.concatenate(spectra_batches, axis=0)
+        shard_name = f"mu1_batch_spectra_shard_{shard_index:05d}.npz"
+        shard_path = output_path / shard_name
+        write_dataset_npz(
+            shard_path,
+            wavelengths=wavelengths,
+            compact_params=shard_compact,
+            full_params=shard_full,
+            spectra=shard_spectra,
+        )
+        shard_records.append(
+            {
+                "path": shard_name,
+                "start": shard_start,
+                "stop": shard_stop,
+                "n_samples": int(shard_stop - shard_start),
+            }
+        )
+        shard_index += 1
+
+    steady_batches = max(n_batches - 1, 1)
+    steady_samples = max(n_samples - batch_size, 1)
+    stats = {
+        "compile_first_batch_sec": compile_seconds,
+        "steady_total_sec": steady_seconds,
+        "steady_batch_mean_sec": steady_seconds / steady_batches,
+        "steady_sample_mean_sec": steady_seconds / steady_samples,
+        "steady_throughput_samples_per_sec": steady_samples / steady_seconds if steady_seconds > 0 else 0.0,
+    }
+    return shard_records, stats
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate batched TransformerPayne spectra with fixed mu=1.")
     parser.add_argument("--n-samples", type=int, default=256, help="Number of spectra to generate.")
@@ -170,10 +265,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for compact parameter sampling.")
     parser.add_argument("--vmic", type=float, default=1.0, help="Microturbulence value used for expansion.")
     parser.add_argument(
+        "--samples-per-shard",
+        type=int,
+        default=0,
+        help="If > 0, write multiple shard files with at most this many samples each.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("mu1_batch_spectra.npz"),
-        help="Output .npz file path.",
+        help="Output .npz file path for single-file mode, or output directory for sharded mode.",
     )
     return parser.parse_args()
 
@@ -186,31 +287,57 @@ def main() -> None:
         raise ValueError("--n-samples must be > 0")
     if args.n_wave <= 1:
         raise ValueError("--n-wave must be > 1")
+    if args.samples_per_shard < 0:
+        raise ValueError("--samples-per-shard must be >= 0")
 
     emulator = TransformerPayne.download()
     wavelengths = np.geomspace(args.wave_min, args.wave_max, args.n_wave).astype(np.float32)
     compact_params = sample_compact_parameters(args.n_samples, args.seed)
 
-    full_params, spectra, stats = generate_dataset(
-        emulator=emulator,
-        compact_params=compact_params,
-        wavelengths=wavelengths,
-        batch_size=args.batch_size,
-        vmic=args.vmic,
-    )
+    if args.samples_per_shard > 0:
+        shard_records, stats = generate_sharded_dataset(
+            emulator=emulator,
+            compact_params=compact_params,
+            wavelengths=wavelengths,
+            batch_size=args.batch_size,
+            samples_per_shard=args.samples_per_shard,
+            output_path=args.output,
+            vmic=args.vmic,
+        )
+        manifest = {
+            "mu": 1.0,
+            "n_samples": args.n_samples,
+            "batch_size": args.batch_size,
+            "n_wave": args.n_wave,
+            "wave_min": args.wave_min,
+            "wave_max": args.wave_max,
+            "vmic": args.vmic,
+            "samples_per_shard": args.samples_per_shard,
+            "shards": shard_records,
+        }
+        manifest_path = args.output / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"Saved sharded dataset to: {args.output}")
+        print(f"n shards: {len(shard_records)}")
+        print(f"last shard samples: {shard_records[-1]['n_samples']}")
+    else:
+        full_params, spectra, stats = generate_dataset(
+            emulator=emulator,
+            compact_params=compact_params,
+            wavelengths=wavelengths,
+            batch_size=args.batch_size,
+            vmic=args.vmic,
+        )
+        write_dataset_npz(
+            args.output,
+            wavelengths=wavelengths,
+            compact_params=compact_params,
+            full_params=full_params,
+            spectra=spectra,
+        )
+        print(f"Saved dataset to: {args.output}")
+        print(f"spectra shape: {spectra.shape}")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.output,
-        wavelengths_angstrom=wavelengths,
-        compact_params=compact_params,
-        model_params=full_params,
-        spectra=spectra,
-        mu=np.array([1.0], dtype=np.float32),
-    )
-
-    print(f"Saved dataset to: {args.output}")
-    print(f"spectra shape: {spectra.shape}")
     print(f"compile first batch: {stats['compile_first_batch_sec']:.4f} s")
     print(f"steady batch mean:   {stats['steady_batch_mean_sec']:.4f} s")
     print(f"steady sample mean:  {stats['steady_sample_mean_sec']:.6f} s")
